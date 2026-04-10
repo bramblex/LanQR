@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::context_menu;
 use crate::errors::LanQrError;
+use crate::i18n::{I18n, LanguagePreference, UiLanguage};
 use crate::models::{LaunchMode, NetworkCandidate, ProcessState, ShareSession, ShareStatus, ShareTarget};
 use crate::network;
 use crate::qr;
@@ -23,6 +24,8 @@ pub struct LanQrApp {
     service: Option<ShareService>,
     network_candidates: Vec<NetworkCandidate>,
     selected_ip_index: usize,
+    language_preference: LanguagePreference,
+    detected_language: UiLanguage,
     share_status: ShareStatus,
     session: Option<ShareSession>,
     qr_texture: Option<TextureHandle>,
@@ -31,7 +34,12 @@ pub struct LanQrApp {
 }
 
 impl LanQrApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, launch_mode: LaunchMode, exe_path: PathBuf) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        launch_mode: LaunchMode,
+        exe_path: PathBuf,
+        detected_language: UiLanguage,
+    ) -> Self {
         configure_fonts(&cc.egui_ctx);
         cc.egui_ctx.request_repaint_after(Duration::from_millis(500));
 
@@ -49,6 +57,8 @@ impl LanQrApp {
             service: None,
             network_candidates,
             selected_ip_index: 0,
+            language_preference: LanguagePreference::Auto,
+            detected_language,
             share_status: ShareStatus::Idle,
             session: None,
             qr_texture: None,
@@ -84,7 +94,7 @@ impl LanQrApp {
         match service.start(&target, ip) {
             Ok(session) => {
                 self.share_status = ShareStatus::Running;
-                self.info_message = Some("共享已启动".to_string());
+                self.set_info(self.i18n().share_started());
                 self.update_qr(ctx, &session.url);
                 info!(url = session.url.as_str(), "share started");
                 self.session = Some(session);
@@ -111,7 +121,7 @@ impl LanQrApp {
         match service.restart(&target, ip) {
             Ok(session) => {
                 self.share_status = ShareStatus::Running;
-                self.info_message = Some("共享已重新生成".to_string());
+                self.set_info(self.i18n().share_regenerated());
                 self.update_qr(ctx, &session.url);
                 self.session = Some(session);
             }
@@ -129,7 +139,7 @@ impl LanQrApp {
             Ok(()) => {
                 self.share_status = ShareStatus::Stopped;
                 self.session = None;
-                self.info_message = Some("共享已停止".to_string());
+                self.set_info(self.i18n().share_stopped());
             }
             Err(error) => self.set_error(error),
         }
@@ -150,10 +160,7 @@ impl LanQrApp {
             ProcessState::Exited(code) => {
                 self.share_status = ShareStatus::Stopped;
                 self.session = None;
-                self.info_message = Some(match code {
-                    Some(code) => format!("共享服务已退出，退出码：{code}"),
-                    None => "共享服务已停止".to_string(),
-                });
+                self.set_info(self.i18n().service_exited(code));
             }
         }
     }
@@ -183,18 +190,16 @@ impl LanQrApp {
             .map_err(|error| LanQrError::ClipboardFailed(error.to_string()))
         {
             Ok(()) => {
-                self.info_message = Some("链接已复制到剪贴板".to_string());
-                self.error_message = None;
+                self.set_info(self.i18n().link_copied());
             }
             Err(error) => self.set_error(error),
         }
     }
 
     fn install_context_menu(&mut self) {
-        match context_menu::install(&self.exe_path) {
+        match context_menu::install(&self.exe_path, self.i18n().lang()) {
             Ok(()) => {
-                self.info_message = Some("右键菜单安装成功".to_string());
-                self.error_message = None;
+                self.set_info(self.i18n().context_menu_installed());
             }
             Err(error) => self.set_error(error),
         }
@@ -203,8 +208,7 @@ impl LanQrApp {
     fn uninstall_context_menu(&mut self) {
         match context_menu::uninstall() {
             Ok(()) => {
-                self.info_message = Some("右键菜单卸载成功".to_string());
-                self.error_message = None;
+                self.set_info(self.i18n().context_menu_uninstalled());
             }
             Err(error) => self.set_error(error),
         }
@@ -213,7 +217,12 @@ impl LanQrApp {
     fn set_error(&mut self, error: LanQrError) {
         error!(error = %error, "application error");
         self.share_status = ShareStatus::Error;
-        self.error_message = Some(error.to_string());
+        self.error_message = Some(self.i18n().error(&error));
+    }
+
+    fn set_info(&mut self, message: impl Into<String>) {
+        self.info_message = Some(message.into());
+        self.error_message = None;
     }
 
     fn current_target(&self) -> Option<&ShareTarget> {
@@ -227,6 +236,9 @@ impl LanQrApp {
         self.network_candidates.get(self.selected_ip_index).map(|candidate| candidate.ip)
     }
 
+    fn i18n(&self) -> I18n {
+        I18n::new(self.language_preference, self.detected_language)
+    }
 }
 
 impl eframe::App for LanQrApp {
@@ -234,34 +246,54 @@ impl eframe::App for LanQrApp {
         self.poll_process();
         ctx.request_repaint_after(Duration::from_millis(500));
 
+        let i18n = self.i18n();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
-            if let Some(target) = self.current_target() {
-                ui.heading(format!("邻享码 - {}", target.display_name));
-            } else {
-                ui.heading("邻享码");
-            }
-            ui.label(RichText::new(status_text(&self.share_status)).strong());
+            ui.heading(i18n.heading(self.current_target().map(|target| target.display_name.as_str())));
+            ui.label(RichText::new(i18n.status_text(&self.share_status)).strong());
             ui.add_space(8.0);
 
             if let Some(target) = self.current_target() {
-                ui.label(format!("对象：{}", target.display_name));
-                ui.label(format!("路径：{}", target.original_path.display()));
-                ui.label(format!("类型：{}", if target.is_dir { "文件夹" } else { "文件" }));
+                ui.label(format!("{}: {}", i18n.object_label(), target.display_name));
+                ui.label(format!("{}: {}", i18n.path_label(), target.original_path.display()));
+                ui.label(format!("{}: {}", i18n.type_label(), i18n.target_type(target.is_dir)));
             } else {
-                ui.label("未选择分享对象");
-                ui.label("请从资源管理器右键文件或文件夹启动，或使用命令行传入路径。");
+                ui.label(i18n.no_target());
+                ui.label(i18n.no_target_help());
             }
 
             ui.add_space(8.0);
+            let mut language_preference = self.language_preference;
+            egui::ComboBox::from_label(i18n.language_label())
+                .selected_text(i18n.language_choice(language_preference))
+                .show_ui(ui, |ui| {
+                    for preference in [
+                        LanguagePreference::Auto,
+                        LanguagePreference::Chinese,
+                        LanguagePreference::English,
+                    ] {
+                        ui.selectable_value(
+                            &mut language_preference,
+                            preference,
+                            i18n.language_choice(preference),
+                        );
+                    }
+                });
+            if language_preference != self.language_preference {
+                self.language_preference = language_preference;
+                self.info_message = None;
+                self.error_message = None;
+            }
+
+            let i18n = self.i18n();
 
             if !self.network_candidates.is_empty() {
-                egui::ComboBox::from_label("本机局域网 IP")
+                egui::ComboBox::from_label(i18n.lan_ip_label())
                     .selected_text(
                         self.network_candidates
                             .get(self.selected_ip_index)
                             .map(|item| item.label.as_str())
-                            .unwrap_or("未选择"),
+                            .unwrap_or(i18n.not_selected()),
                     )
                     .show_ui(ui, |ui| {
                         for (index, candidate) in self.network_candidates.iter().enumerate() {
@@ -269,7 +301,7 @@ impl eframe::App for LanQrApp {
                         }
                     });
             } else {
-                ui.label(RichText::new("未找到可用的局域网 IPv4").color(egui::Color32::RED));
+                ui.label(RichText::new(i18n.no_lan_ipv4()).color(egui::Color32::RED));
             }
 
             ui.add_space(10.0);
@@ -283,7 +315,7 @@ impl eframe::App for LanQrApp {
                     ui.set_min_height(220.0);
                     ui.vertical_centered(|ui| {
                         ui.add_space(88.0);
-                        ui.label("二维码会显示在这里");
+                        ui.label(i18n.qr_placeholder());
                     });
                 });
             }
@@ -291,10 +323,10 @@ impl eframe::App for LanQrApp {
             ui.add_space(10.0);
 
             if let Some(session) = self.session.as_ref() {
-                ui.label(format!("访问链接：{}", session.url));
-                ui.label(format!("端口：{}", session.port));
-                ui.label(format!("路径片段：{}", session.route));
-                ui.label(format!("当前 IP：{}", session.ip));
+                ui.label(format!("{}: {}", i18n.url_label(), session.url));
+                ui.label(format!("{}: {}", i18n.port_label(), session.port));
+                ui.label(format!("{}: {}", i18n.route_label(), session.route));
+                ui.label(format!("{}: {}", i18n.current_ip_label(), session.ip));
             }
 
             if let Some(message) = self.error_message.as_ref() {
@@ -311,19 +343,19 @@ impl eframe::App for LanQrApp {
             ui.horizontal(|ui| {
                 let can_share = self.current_target().is_some();
                 if ui
-                    .add_enabled(self.session.is_some(), egui::Button::new("复制链接"))
+                    .add_enabled(self.session.is_some(), egui::Button::new(i18n.copy_link()))
                     .clicked()
                 {
                     self.copy_link();
                 }
                 if ui
-                    .add_enabled(can_share, egui::Button::new("重新生成"))
+                    .add_enabled(can_share, egui::Button::new(i18n.regenerate()))
                     .clicked()
                 {
                     self.restart_share(ctx);
                 }
                 if ui
-                    .add_enabled(self.service.is_some(), egui::Button::new("关闭分享"))
+                    .add_enabled(self.service.is_some(), egui::Button::new(i18n.stop_share()))
                     .clicked()
                 {
                     self.stop_share();
@@ -335,10 +367,10 @@ impl eframe::App for LanQrApp {
                 ui.separator();
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("安装右键菜单").clicked() {
+                    if ui.button(i18n.install_context_menu()).clicked() {
                         self.install_context_menu();
                     }
-                    if ui.button("卸载右键菜单").clicked() {
+                    if ui.button(i18n.uninstall_context_menu()).clicked() {
                         self.uninstall_context_menu();
                     }
                 });
@@ -352,16 +384,6 @@ impl eframe::App for LanQrApp {
                 error!(error = %error, "failed to stop share service on exit");
             }
         }
-    }
-}
-
-fn status_text(status: &ShareStatus) -> &'static str {
-    match status {
-        ShareStatus::Idle => "当前状态：空闲",
-        ShareStatus::Starting => "当前状态：启动中",
-        ShareStatus::Running => "当前状态：运行中",
-        ShareStatus::Stopped => "当前状态：已停止",
-        ShareStatus::Error => "当前状态：出错",
     }
 }
 

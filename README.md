@@ -1,56 +1,65 @@
 # LanQR / 邻享码
 
-LanQR 是一个偏工程落地的 Windows 桌面工具：在资源管理器里右键文件或文件夹，启动一个本地 GUI 窗口，直接在程序内启动局域网静态分享服务，并展示可扫码访问的二维码。
+LanQR is a Windows desktop utility for sharing a file or folder on the local network with a QR code.
+LanQR 是一个 Windows 桌面工具，用来把单个文件或文件夹通过局域网分享出去，并生成可扫码访问的二维码。
 
-第一版目标是稳定、清晰、易打包，不做复杂架构，不做 Web UI，不做 shell extension。
+The current build ships with a built-in static file server, bilingual UI, and Explorer context-menu integration.
+当前版本内置静态文件服务、支持中英文界面，并集成资源管理器右键菜单。
 
-## 功能
+## Features / 功能
 
-- 支持单个文件分享
-- 支持单个文件夹分享
-- GUI 展示二维码、下载链接、对象名称、本机 IP、端口、状态
-- 支持复制链接、重新生成、关闭分享
-- 关闭窗口时停止对应分享服务
+- Single-file sharing with a direct download link
+- 单文件分享，打开链接后直接下载
+
+- Single-folder sharing with a lightweight directory listing
+- 单文件夹分享，打开链接后进入轻量目录页
+
+- QR code, URL, IP, port, status, and target details in the GUI
+- GUI 中展示二维码、链接、IP、端口、状态和目标信息
+
+- Automatic language choice with a manual language switcher
+- 自动选择中英文，并提供手动语言切换选项
+
+- User-level Explorer context menu install/uninstall
 - 支持当前用户级资源管理器右键菜单安装/卸载
+
+- Multiple independent instances can run at the same time
 - 支持多个独立实例同时运行，互不干扰
 
-## 技术方案
+## Stack / 技术方案
 
-- 语言：Rust
-- GUI：`eframe` / `egui`
-- 分享服务：`axum` + `tower-http::ServeFile`
-- 二维码：程序内根据最终 URL 自行生成
-- 右键菜单：当前用户级注册表 `HKCU\Software\Classes`
+- Rust
+- `eframe` / `egui`
+- `axum` + `tower-http::ServeFile`
+- QR generation inside the app
+- Windows registry verbs under `HKCU\Software\Classes`
 
-## 为什么自己生成二维码
+## Language / 语言
 
-LanQR 直接根据最终 URL 生成二维码，原因很直接：
+LanQR detects the system locale and chooses Chinese when the locale starts with `zh`; otherwise it uses English.
+LanQR 会检测系统语言；当系统 locale 以 `zh` 开头时默认显示中文，否则默认显示英文。
 
-- GUI 需要稳定可控的二维码图像
-- 程序自己掌握 IP、端口、路由路径，直接生成二维码更清晰
-- 这样可以把 URL、二维码和 GUI 状态保持一致
+You can also switch the app language manually from the in-app language selector.
+你也可以在程序内通过语言选择框手动切换显示语言。
 
-## 分享行为
+When you install the context menu, the menu text is written using the language that is active at install time.
+安装右键菜单时，菜单文本会使用安装当下生效的界面语言。
 
-- 分享单个文件时，二维码对应的链接会直接下载该文件
-- 分享文件夹时，二维码对应的链接会打开一个简单的目录页，可继续浏览和下载子文件
-- 目录和文件都通过随机路由片段隔离，默认 URL 形如 `http://<ip>:<port>/send/<token>` 或 `http://<ip>:<port>/send/<token>/`
+## Runtime Behavior / 运行行为
 
-## 为什么第一版使用注册表 verb
+- File share URL: `http://<ip>:<port>/send/<token>`
+- 文件分享 URL：`http://<ip>:<port>/send/<token>`
 
-第一版右键菜单只用注册表 verb，不做复杂 shell extension，原因是：
+- Folder share URL: `http://<ip>:<port>/send/<token>/`
+- 文件夹分享 URL：`http://<ip>:<port>/send/<token>/`
 
-- 当前用户级即可安装，不依赖管理员权限
-- 实现简单，维护成本低
-- 更适合 MVP，易验证、易打包、易回滚
+- Files are served with `Content-Disposition`, so the downloaded filename stays correct
+- 文件响应会带 `Content-Disposition`，下载文件名会保持为原始文件名
 
-## 为什么选择 Rust + egui
+- Range requests are handled by the server stack, so mobile downloads are more stable
+- 服务端支持 `Range` 请求，手机下载更稳定
 
-- Rust 适合做独立 Windows 工具，单文件可执行产物清晰
-- `egui` 集成简单，足够完成工具型桌面 UI
-- 不需要浏览器壳，也不需要 Electron/Tauri/Flutter 这类额外运行时
-
-## 开发运行
+## Development / 开发运行
 
 ```powershell
 cargo run -- "D:\test\file.zip"
@@ -58,84 +67,89 @@ cargo run -- "D:\test\folder"
 cargo run
 ```
 
-无参数时会进入空闲页，不会崩溃。
+Without arguments, LanQR opens the idle page.
+不带参数时，LanQR 会进入空闲页。
 
-## 打包
+## Packaging / 打包
 
 ```powershell
 .\build.ps1
 ```
 
-脚本会自动完成这些动作：
+The script does the following:
+脚本会自动完成以下动作：
 
-- 执行 `cargo build --release`
-- 把 `LanQR.exe` 和 `README.md` 复制到顶层 `dist/LanQR/`
+- Build `LanQR.exe` in release mode
+- 编译 release 版 `LanQR.exe`
 
-最终发布目录为：
+- Copy `LanQR.exe`, `LanQR.ico`, and `README.md` into `dist/LanQR/`
+- 把 `LanQR.exe`、`LanQR.ico` 和 `README.md` 复制到 `dist/LanQR/`
+
+- Create `dist/LanQR-<tag-or-version>-<git-hash>.zip`
+- 生成 `dist/LanQR-<tag或版本>-<git哈希>.zip`
+
+Release output layout:
+发布产物目录：
 
 ```text
 dist/
   LanQR/
     LanQR.exe
+    LanQR.ico
     README.md
+  LanQR-<tag-or-version>-<git-hash>.zip
 ```
 
-## 使用方式
+## Usage / 使用方式
 
-### 直接传路径启动
+### Launch with a path / 直接传路径启动
 
 ```powershell
 LanQR.exe "D:\test\file.zip"
 LanQR.exe "D:\test\folder"
 ```
 
-### 安装右键菜单
-
-支持命令行：
+### Install the context menu / 安装右键菜单
 
 ```powershell
 LanQR.exe --install-context-menu
 LanQR.exe --uninstall-context-menu
 ```
 
-也支持无参数启动后在 GUI 空闲页点击安装/卸载按钮。
+You can also install or uninstall it from the idle page in the GUI.
+也可以在 GUI 空闲页中点击按钮安装或卸载。
 
-安装后，文件和文件夹右键菜单都会出现：
-
-```text
-生成局域网二维码
-```
-
-点击后会执行：
-
-```text
-LanQR.exe "%1"
-```
-
-## 右键菜单注册位置
-
-LanQR 第一版写入：
+Registry keys used by the first version:
+第一版写入的注册表位置：
 
 - `HKCU\Software\Classes\*\shell\LanQR`
 - `HKCU\Software\Classes\Directory\shell\LanQR`
 
-不会强制请求管理员权限。
+No administrator permission is required.
+不需要管理员权限。
 
-## 已知限制
+## Limits / 已知限制
 
-- 第一版仅支持单个文件或单个文件夹
-- 不支持多选
-- 需要手机和电脑处于同一局域网
-- 需要 Windows 防火墙允许访问对应端口
-- 当前目录页比较简洁，不提供搜索、预览或上传能力
-- 大文件和大量并发请求仍然属于轻量级场景，不是高吞吐文件服务
+- One file or one folder per share session
+- 每次只分享一个文件或一个文件夹
 
-## 日志
+- No multi-select support yet
+- 暂不支持多选
 
-日志目录：
+- Devices must be on the same local network
+- 手机和电脑需要位于同一局域网
+
+- Windows Firewall still needs to allow access to the chosen port
+- Windows 防火墙仍需允许对应端口访问
+
+- The directory page is intentionally simple: no preview, upload, or search
+- 目录页刻意保持轻量，不提供预览、上传或搜索
+
+## Logs / 日志
 
 ```text
 %LOCALAPPDATA%\LanQR\logs
 ```
 
-日志会记录启动参数、目标路径、选中的 IP、端口、URL、分享服务启动/停止状态和异常信息。
+Logs include launch arguments, selected target, IP, port, URL, share-service lifecycle, and errors.
+日志会记录启动参数、目标路径、IP、端口、URL、共享服务生命周期和异常信息。

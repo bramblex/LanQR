@@ -18,6 +18,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ipconfig = "0.3"
 qrcode = "0.14"
 rand = "0.8"
+sys-locale = "0.3"
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync"] }
 tower = { version = "0.5", features = ["util"] }

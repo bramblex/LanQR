@@ -3,6 +3,7 @@
 mod app;
 mod context_menu;
 mod errors;
+mod i18n;
 mod logging;
 mod models;
 mod network;
@@ -21,16 +22,29 @@ use tracing::{error, info};
 use crate::app::LanQrApp;
 use crate::context_menu::{install, uninstall};
 use crate::errors::{LanQrError, Result};
+use crate::i18n::{detect_system_language, I18n, LanguagePreference, UiLanguage};
 use crate::models::{LaunchMode, ShareTarget};
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
+    let system_language = detect_system_language();
+
+    if let Err(error) = run(system_language) {
+        eprintln!(
+            "{}",
+            I18n::new(
+                match system_language {
+                    UiLanguage::Chinese => LanguagePreference::Chinese,
+                    UiLanguage::English => LanguagePreference::English,
+                },
+                system_language,
+            )
+            .error(&error)
+        );
         error!(error = %error, "fatal startup error");
     }
 }
 
-fn run() -> Result<()> {
+fn run(system_language: UiLanguage) -> Result<()> {
     let (_log_dir, _guard) = logging::init_logging()?;
     let exe_path = env::current_exe()?;
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -38,9 +52,9 @@ fn run() -> Result<()> {
     info!(args = ?args, exe = %exe_path.display(), "LanQR starting");
 
     match parse_launch_mode(&args)? {
-        ParsedLaunch::Gui(launch_mode) => launch_gui(launch_mode, exe_path),
+        ParsedLaunch::Gui(launch_mode) => launch_gui(launch_mode, exe_path, system_language),
         ParsedLaunch::InstallContextMenu => {
-            install(&exe_path)?;
+            install(&exe_path, system_language)?;
             info!("context menu installed from cli");
             Ok(())
         }
@@ -52,29 +66,42 @@ fn run() -> Result<()> {
     }
 }
 
-fn launch_gui(launch_mode: LaunchMode, exe_path: PathBuf) -> Result<()> {
+fn launch_gui(launch_mode: LaunchMode, exe_path: PathBuf, system_language: UiLanguage) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("邻享码")
+            .with_title("LanQR / 邻享码")
             .with_inner_size([520.0, 720.0])
             .with_min_inner_size([480.0, 640.0])
-            .with_icon(load_app_icon()?),
+            .with_icon(load_app_icon(system_language)?),
         ..Default::default()
     };
 
     eframe::run_native(
-        "邻享码",
+        "LanQR / 邻享码",
         options,
-        Box::new(move |cc| Ok(Box::new(LanQrApp::new(cc, launch_mode.clone(), exe_path.clone())))),
+        Box::new(move |cc| {
+            Ok(Box::new(LanQrApp::new(
+                cc,
+                launch_mode.clone(),
+                exe_path.clone(),
+                system_language,
+            )))
+        }),
     )
-    .map_err(|error| LanQrError::Message(format!("启动 GUI 失败：{error}")))?;
+    .map_err(|error| match system_language {
+        UiLanguage::Chinese => LanQrError::Message(format!("启动 GUI 失败：{error}")),
+        UiLanguage::English => LanQrError::Message(format!("Failed to launch GUI: {error}")),
+    })?;
 
     Ok(())
 }
 
-fn load_app_icon() -> Result<Arc<egui::IconData>> {
+fn load_app_icon(system_language: UiLanguage) -> Result<Arc<egui::IconData>> {
     let icon = icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
-        .map_err(|error| LanQrError::Message(format!("加载程序图标失败：{error}")))?;
+        .map_err(|error| match system_language {
+            UiLanguage::Chinese => LanQrError::Message(format!("加载程序图标失败：{error}")),
+            UiLanguage::English => LanQrError::Message(format!("Failed to load app icon: {error}")),
+        })?;
     Ok(Arc::new(icon))
 }
 

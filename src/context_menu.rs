@@ -4,18 +4,26 @@ use std::process::Command;
 use tracing::info;
 
 use crate::errors::{LanQrError, Result};
+use crate::i18n::{I18n, LanguagePreference, UiLanguage};
 
 const FILE_KEY: &str = r"HKCU\Software\Classes\*\shell\LanQR";
 const DIRECTORY_KEY: &str = r"HKCU\Software\Classes\Directory\shell\LanQR";
-const MENU_TEXT: &str = "生成局域网二维码";
 
-pub fn install(exe_path: &Path) -> Result<()> {
+pub fn install(exe_path: &Path, language: UiLanguage) -> Result<()> {
     let exe = exe_path.to_string_lossy();
     let command_value = format!("\"{exe}\" \"%1\"");
     let icon_value = icon_value_for_exe(exe_path);
+    let menu_text = I18n::new(
+        match language {
+            UiLanguage::Chinese => LanguagePreference::Chinese,
+            UiLanguage::English => LanguagePreference::English,
+        },
+        language,
+    )
+    .menu_text();
 
-    install_single(FILE_KEY, &command_value, &icon_value)?;
-    install_single(DIRECTORY_KEY, &command_value, &icon_value)?;
+    install_single(FILE_KEY, &command_value, &icon_value, menu_text)?;
+    install_single(DIRECTORY_KEY, &command_value, &icon_value, menu_text)?;
 
     info!(exe_path = %exe, "installed context menu");
     Ok(())
@@ -33,7 +41,7 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-fn install_single(base_key: &str, command_value: &str, icon_value: &str) -> Result<()> {
+fn install_single(base_key: &str, command_value: &str, icon_value: &str, menu_text: &str) -> Result<()> {
     run_reg(&[
         "add",
         base_key,
@@ -41,7 +49,7 @@ fn install_single(base_key: &str, command_value: &str, icon_value: &str) -> Resu
         "/t",
         "REG_SZ",
         "/d",
-        MENU_TEXT,
+        menu_text,
         "/f",
     ])
     .map_err(|error| LanQrError::ContextMenuInstallFailed(error.to_string()))?;
