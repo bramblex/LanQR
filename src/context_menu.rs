@@ -12,12 +12,18 @@ const MENU_TEXT: &str = "生成局域网二维码";
 pub fn install(exe_path: &Path) -> Result<()> {
     let exe = exe_path.to_string_lossy();
     let command_value = format!("\"{exe}\" \"%1\"");
+    let icon_value = icon_value_for_exe(exe_path);
 
-    install_single(FILE_KEY, &command_value, &exe)?;
-    install_single(DIRECTORY_KEY, &command_value, &exe)?;
+    install_single(FILE_KEY, &command_value, &icon_value)?;
+    install_single(DIRECTORY_KEY, &command_value, &icon_value)?;
 
     info!(exe_path = %exe, "installed context menu");
     Ok(())
+}
+
+fn icon_value_for_exe(exe_path: &Path) -> String {
+    let sidecar_icon = exe_path.with_extension("ico");
+    format!("\"{}\"", sidecar_icon.to_string_lossy())
 }
 
 pub fn uninstall() -> Result<()> {
@@ -27,7 +33,7 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-fn install_single(base_key: &str, command_value: &str, exe_path: &str) -> Result<()> {
+fn install_single(base_key: &str, command_value: &str, icon_value: &str) -> Result<()> {
     run_reg(&[
         "add",
         base_key,
@@ -48,7 +54,7 @@ fn install_single(base_key: &str, command_value: &str, exe_path: &str) -> Result
         "/t",
         "REG_SZ",
         "/d",
-        exe_path,
+        icon_value,
         "/f",
     ])
     .map_err(|error| LanQrError::ContextMenuInstallFailed(error.to_string()))?;

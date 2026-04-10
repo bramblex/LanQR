@@ -1,15 +1,21 @@
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::fs;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
+use axum::extract::{OriginalUri, Path as AxumPath, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::get;
+use axum::Router;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::sync::oneshot;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 use tracing::{info, warn};
 
 use crate::errors::{LanQrError, Result};
@@ -17,12 +23,10 @@ use crate::models::{ProcessState, ShareSession, ShareTarget};
 use crate::network;
 
 const ROUTE_PREFIX: &str = "/send/";
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct ShareService {
     server_thread: Option<JoinHandle<()>>,
-    stop_flag: Option<Arc<AtomicBool>>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
     current_session: Option<ShareSession>,
 }
 
@@ -30,7 +34,7 @@ impl ShareService {
     pub fn new() -> Self {
         Self {
             server_thread: None,
-            stop_flag: None,
+            shutdown_tx: None,
             current_session: None,
         }
     }
@@ -47,11 +51,10 @@ impl ShareService {
             .map_err(|error| LanQrError::ShareServiceStartFailed(error.to_string()))?
             .port();
         let route = random_route(10);
+        let base_path = format!("{ROUTE_PREFIX}{route}");
         let final_url = build_share_url(ip, port, &route, target.is_dir);
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let thread_target = Arc::new(target.clone());
-        let thread_route = route.clone();
-        let thread_stop = Arc::clone(&stop_flag);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let router = build_router(target.clone(), base_path.clone());
 
         info!(
             target = %target.original_path.display(),
@@ -63,7 +66,36 @@ impl ShareService {
         );
 
         let server_thread = thread::spawn(move || {
-            run_server(listener, thread_stop, thread_target, thread_route);
+            let runtime = match RuntimeBuilder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    warn!(error = %error, "failed to build tokio runtime for share service");
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        warn!(error = %error, "failed to adopt tcp listener for share service");
+                        return;
+                    }
+                };
+
+                let server = axum::serve(listener, router.into_make_service())
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    });
+
+                if let Err(error) = server.await {
+                    warn!(error = %error, "share service stopped with server error");
+                }
+            });
         });
 
         let session = ShareSession {
@@ -74,7 +106,7 @@ impl ShareService {
         };
 
         self.server_thread = Some(server_thread);
-        self.stop_flag = Some(stop_flag);
+        self.shutdown_tx = Some(shutdown_tx);
         self.current_session = Some(session.clone());
 
         Ok(session)
@@ -99,14 +131,14 @@ impl ShareService {
             }
         }
 
-        self.stop_flag = None;
+        self.shutdown_tx = None;
         self.current_session = None;
         ProcessState::Exited(None)
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        if let Some(stop_flag) = self.stop_flag.take() {
-            stop_flag.store(true, Ordering::Relaxed);
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
 
             if let Some(session) = self.current_session.as_ref() {
                 let _ = TcpStream::connect(SocketAddrV4::new(session.ip, session.port));
@@ -130,175 +162,138 @@ impl Drop for ShareService {
     }
 }
 
-fn run_server(
-    listener: TcpListener,
-    stop_flag: Arc<AtomicBool>,
-    target: Arc<ShareTarget>,
-    route: String,
-) {
-    let base_path = format!("{ROUTE_PREFIX}{route}");
-    info!(base_path = base_path.as_str(), "share service listening");
-
-    while !stop_flag.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                let request_target = Arc::clone(&target);
-                let request_base = base_path.clone();
-                thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, &request_target, &request_base) {
-                        warn!(peer = %peer, error = %error, "request handling failed");
-                    }
-                });
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(POLL_INTERVAL);
-            }
-            Err(error) => {
-                warn!(error = %error, "share service listener stopped unexpectedly");
-                break;
-            }
-        }
-    }
-
-    info!("share service stopped");
-}
-
-fn handle_client(mut stream: TcpStream, target: &ShareTarget, base_path: &str) -> io::Result<()> {
-    let request = read_request(&stream)?;
-
-    if request.method != "GET" && request.method != "HEAD" {
-        return write_plain_response(
-            &mut stream,
-            "405 Method Not Allowed",
-            "text/plain; charset=utf-8",
-            b"Method Not Allowed",
-            request.method == "HEAD",
-        );
-    }
-
-    let request_path = strip_query_and_fragment(&request.path);
-
+fn build_router(target: ShareTarget, base_path: String) -> Router {
     if target.is_dir {
-        handle_directory_request(&mut stream, target, base_path, request_path, request.method == "HEAD")
+        build_directory_router(target.original_path, base_path)
     } else {
-        handle_file_request(&mut stream, target, base_path, request_path, request.method == "HEAD")
+        build_file_router(target.original_path, base_path)
     }
 }
 
-fn handle_file_request(
-    stream: &mut TcpStream,
-    target: &ShareTarget,
-    base_path: &str,
-    request_path: &str,
-    head_only: bool,
-) -> io::Result<()> {
-    if request_path != base_path && request_path != format!("{base_path}/") {
-        return write_plain_response(stream, "404 Not Found", "text/plain; charset=utf-8", b"Not Found", head_only);
-    }
+fn build_file_router(file_path: PathBuf, base_path: String) -> Router {
+    let trailing_path = format!("{base_path}/");
+    let redirect_path = base_path.clone();
+    let state = Arc::new(FileShareState { path: file_path });
 
-    serve_file(stream, &target.original_path, head_only)
+    Router::new()
+        .route(&base_path, get(file_handler))
+        .route(
+            &trailing_path,
+            get(move || {
+                let redirect_path = redirect_path.clone();
+                async move { Redirect::permanent(&redirect_path) }
+            }),
+        )
+        .with_state(state)
 }
 
-fn handle_directory_request(
-    stream: &mut TcpStream,
-    target: &ShareTarget,
-    base_path: &str,
-    request_path: &str,
-    head_only: bool,
-) -> io::Result<()> {
-    if request_path == base_path {
-        return write_redirect(stream, &format!("{base_path}/"));
-    }
+fn build_directory_router(root: PathBuf, base_path: String) -> Router {
+    let state = Arc::new(DirectoryShareState { root });
+    let slash_path = format!("{base_path}/");
+    let wildcard_path = format!("{base_path}/*tail");
+    let redirect_target = slash_path.clone();
 
-    let Some(mut relative) = request_path.strip_prefix(base_path) else {
-        return write_plain_response(stream, "404 Not Found", "text/plain; charset=utf-8", b"Not Found", head_only);
+    Router::new()
+        .route(
+            &base_path,
+            get(move || {
+                let redirect_target = redirect_target.clone();
+                async move { Redirect::permanent(&redirect_target) }
+            }),
+        )
+        .route(&slash_path, get(directory_root_handler))
+        .route(&wildcard_path, get(directory_tail_handler))
+        .with_state(state)
+}
+
+async fn directory_root_handler(
+    State(state): State<Arc<DirectoryShareState>>,
+    OriginalUri(uri): OriginalUri,
+    request: Request,
+) -> Response {
+    serve_directory_entry(state, PathBuf::new(), uri.path().to_string(), request).await
+}
+
+async fn file_handler(
+    State(state): State<Arc<FileShareState>>,
+    request: Request,
+) -> Response {
+    serve_file_response(state.path.clone(), request).await
+}
+
+async fn directory_tail_handler(
+    State(state): State<Arc<DirectoryShareState>>,
+    AxumPath(tail): AxumPath<String>,
+    OriginalUri(uri): OriginalUri,
+    request: Request,
+) -> Response {
+    let relative = match normalize_relative_path(&tail) {
+        Some(relative) => relative,
+        None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    if !relative.starts_with('/') {
-        return write_plain_response(stream, "404 Not Found", "text/plain; charset=utf-8", b"Not Found", head_only);
-    }
+    serve_directory_entry(state, relative, uri.path().to_string(), request).await
+}
 
-    relative = &relative[1..];
-    let normalized = match normalize_relative_path(relative) {
-        Some(path) => path,
-        None => {
-            return write_plain_response(
-                stream,
-                "400 Bad Request",
-                "text/plain; charset=utf-8",
-                b"Invalid Path",
-                head_only,
-            );
-        }
-    };
-
-    let filesystem_path = target.original_path.join(&normalized);
+async fn serve_directory_entry(
+    state: Arc<DirectoryShareState>,
+    relative: PathBuf,
+    request_path: String,
+    request: Request,
+) -> Response {
+    let filesystem_path = state.root.join(&relative);
     let metadata = match fs::metadata(&filesystem_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return write_plain_response(stream, "404 Not Found", "text/plain; charset=utf-8", b"Not Found", head_only);
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            warn!(path = %filesystem_path.display(), error = %error, "failed to read shared path metadata");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
     if metadata.is_dir() {
         if !request_path.ends_with('/') {
-            return write_redirect(stream, &format!("{request_path}/"));
+            return Redirect::permanent(&format!("{request_path}/")).into_response();
         }
 
-        return serve_directory_listing(stream, &filesystem_path, &normalized, head_only);
+        match build_directory_listing_html(&filesystem_path, &relative) {
+            Ok(html) => Html(html).into_response(),
+            Err(error) => {
+                warn!(path = %filesystem_path.display(), error = %error, "failed to build directory listing");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+    } else {
+        serve_file_response(filesystem_path, request).await
     }
-
-    serve_file(stream, &filesystem_path, head_only)
 }
 
-fn serve_file(stream: &mut TcpStream, path: &Path, head_only: bool) -> io::Result<()> {
-    let metadata = fs::metadata(path)?;
-    let content_length = metadata.len();
-    let filename = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_string());
-    let content_type = detect_content_type(path);
-    let disposition = build_content_disposition(&filename);
-
-    write_headers(
-        stream,
-        "200 OK",
-        &[
-            ("Content-Type", content_type),
-            ("Content-Length", content_length.to_string()),
-            ("Content-Disposition", disposition),
-            ("Cache-Control", "no-store".to_string()),
-        ],
-    )?;
-
-    if head_only {
-        return Ok(());
+async fn serve_file_response(path: PathBuf, request: Request) -> Response {
+    let disposition = build_content_disposition_header(&path);
+    match ServeFile::new(path).oneshot(request).await {
+        Ok(mut response) => {
+            if let Some(disposition) = disposition {
+                response.headers_mut().insert(header::CONTENT_DISPOSITION, disposition);
+            }
+            response.into_response()
+        }
+        Err(error) => match error {},
     }
-
-    let mut file = File::open(path)?;
-    io::copy(&mut file, stream)?;
-    Ok(())
 }
 
-fn serve_directory_listing(
-    stream: &mut TcpStream,
-    path: &Path,
-    relative: &Path,
-    head_only: bool,
-) -> io::Result<()> {
+fn build_directory_listing_html(path: &Path, relative: &Path) -> std::io::Result<String> {
     let mut entries = Vec::new();
 
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let entry_path = entry.path();
         let metadata = entry.metadata()?;
         let name = entry.file_name().to_string_lossy().to_string();
         entries.push(DirectoryEntry {
             name,
             is_dir: metadata.is_dir(),
-            path: entry_path,
+            size: metadata.len(),
         });
     }
 
@@ -309,17 +304,6 @@ fn serve_directory_listing(
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
 
-    let body = build_directory_listing_html(relative, &entries);
-    write_plain_response(
-        stream,
-        "200 OK",
-        "text/html; charset=utf-8",
-        body.as_bytes(),
-        head_only,
-    )
-}
-
-fn build_directory_listing_html(relative: &Path, entries: &[DirectoryEntry]) -> String {
     let title = if relative.components().next().is_none() {
         "/".to_string()
     } else {
@@ -339,13 +323,13 @@ li{{background:#fff;border:1px solid #dbe3f0;border-radius:10px;margin:8px 0}}\
 a{{display:block;padding:14px 16px;color:#0f172a;text-decoration:none;word-break:break-all}}\
 a:hover{{background:#eef4ff}}\
 .meta{{color:#64748b;font-size:13px}}\
-</style></head><body><main><h1>目录 {}</h1><div class=\"meta\">LanQR 内置静态分享服务</div><ul>",
+</style></head><body><main><h1>目录 {}</h1><div class=\"meta\">LanQR 静态分享</div><ul>",
         html_escape(&title),
         html_escape(&title),
     );
 
     if relative.components().next().is_some() {
-        html.push_str("<li><a href=\"../\">..</a></li>");
+        html.push_str("<li><a href=\"../\">..<div class=\"meta\">返回上级目录</div></a></li>");
     }
 
     for entry in entries {
@@ -356,96 +340,24 @@ a:hover{{background:#eef4ff}}\
         } else {
             entry.name.clone()
         };
-        let size_meta = if entry.is_dir {
+        let meta = if entry.is_dir {
             "目录".to_string()
         } else {
-            match entry.path.metadata() {
-                Ok(metadata) => format!("文件 · {} 字节", metadata.len()),
-                Err(_) => "文件".to_string(),
-            }
+            format!("文件 · {} 字节", entry.size)
         };
+
         let _ = write!(
             html,
             "<li><a href=\"{}{}\">{}<div class=\"meta\">{}</div></a></li>",
             encoded,
             suffix,
             html_escape(&label),
-            html_escape(&size_meta),
+            html_escape(&meta),
         );
     }
 
     html.push_str("</ul></main></body></html>");
-    html
-}
-
-fn read_request(stream: &TcpStream) -> io::Result<HttpRequest> {
-    stream.set_read_timeout(Some(HEADER_READ_TIMEOUT))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    let bytes = reader.read_line(&mut request_line)?;
-    if bytes == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty request"));
-    }
-
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 || line == "\r\n" {
-            break;
-        }
-    }
-
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let path = parts.next().unwrap_or("/").to_string();
-
-    Ok(HttpRequest { method, path })
-}
-
-fn write_redirect(stream: &mut TcpStream, location: &str) -> io::Result<()> {
-    write_headers(
-        stream,
-        "301 Moved Permanently",
-        &[
-            ("Location", location.to_string()),
-            ("Content-Length", "0".to_string()),
-            ("Cache-Control", "no-store".to_string()),
-        ],
-    )
-}
-
-fn write_plain_response(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &[u8],
-    head_only: bool,
-) -> io::Result<()> {
-    write_headers(
-        stream,
-        status,
-        &[
-            ("Content-Type", content_type.to_string()),
-            ("Content-Length", body.len().to_string()),
-            ("Cache-Control", "no-store".to_string()),
-        ],
-    )?;
-
-    if !head_only {
-        stream.write_all(body)?;
-    }
-
-    Ok(())
-}
-
-fn write_headers(stream: &mut TcpStream, status: &str, headers: &[(&str, String)]) -> io::Result<()> {
-    write!(stream, "HTTP/1.1 {status}\r\n")?;
-    write!(stream, "Connection: close\r\n")?;
-    for (name, value) in headers {
-        write!(stream, "{name}: {value}\r\n")?;
-    }
-    write!(stream, "\r\n")?;
-    stream.flush()
+    Ok(html)
 }
 
 fn normalize_relative_path(input: &str) -> Option<PathBuf> {
@@ -459,12 +371,11 @@ fn normalize_relative_path(input: &str) -> Option<PathBuf> {
             continue;
         }
 
-        let decoded = percent_decode(segment)?;
-        if decoded.contains('\\') || decoded.contains('\0') {
+        if segment.contains('\\') || segment.contains('\0') {
             return None;
         }
 
-        let component_path = Path::new(&decoded);
+        let component_path = Path::new(segment);
         if component_path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -472,38 +383,10 @@ fn normalize_relative_path(input: &str) -> Option<PathBuf> {
             return None;
         }
 
-        result.push(decoded);
+        result.push(segment);
     }
 
     Some(result)
-}
-
-fn percent_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let value = decode_hex_pair(bytes[index + 1], bytes[index + 2])?;
-                decoded.push(value);
-                index += 3;
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-
-    String::from_utf8(decoded).ok()
-}
-
-fn decode_hex_pair(left: u8, right: u8) -> Option<u8> {
-    let left = (left as char).to_digit(16)?;
-    let right = (right as char).to_digit(16)?;
-    Some(((left << 4) | right) as u8)
 }
 
 fn percent_encode_path_segment(input: &str) -> String {
@@ -526,7 +409,17 @@ fn html_escape(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn build_content_disposition(filename: &str) -> String {
+fn random_route(length: usize) -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .map(char::from)
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(length)
+        .collect()
+}
+
+fn build_content_disposition_header(path: &Path) -> Option<HeaderValue> {
+    let filename = path.file_name()?.to_string_lossy();
     let fallback = filename
         .chars()
         .map(|ch| match ch {
@@ -535,51 +428,9 @@ fn build_content_disposition(filename: &str) -> String {
             _ => '_',
         })
         .collect::<String>();
-
-    format!(
-        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
-        fallback,
-        percent_encode_path_segment(filename)
-    )
-}
-
-fn detect_content_type(path: &Path) -> String {
-    let extension = path
-        .extension()
-        .and_then(|item| item.to_str())
-        .map(|item| item.to_ascii_lowercase());
-
-    match extension.as_deref() {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        Some("txt") | Some("log") => "text/plain; charset=utf-8",
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("js") => "application/javascript; charset=utf-8",
-        Some("json") => "application/json; charset=utf-8",
-        Some("pdf") => "application/pdf",
-        Some("zip") => "application/zip",
-        Some("mp3") => "audio/mpeg",
-        Some("mp4") => "video/mp4",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
-
-fn strip_query_and_fragment(path: &str) -> &str {
-    path.split(['?', '#']).next().unwrap_or(path)
-}
-
-fn random_route(length: usize) -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .map(char::from)
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(length)
-        .collect()
+    let encoded = percent_encode_path_segment(&filename);
+    let value = format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}");
+    HeaderValue::from_str(&value).ok()
 }
 
 fn build_share_url(ip: Ipv4Addr, port: u16, route: &str, is_dir: bool) -> String {
@@ -590,13 +441,79 @@ fn build_share_url(ip: Ipv4Addr, port: u16, route: &str, is_dir: bool) -> String
     }
 }
 
-struct HttpRequest {
-    method: String,
-    path: String,
+struct DirectoryShareState {
+    root: PathBuf,
+}
+
+struct FileShareState {
+    path: PathBuf,
 }
 
 struct DirectoryEntry {
     name: String,
     is_dir: bool,
-    path: PathBuf,
+    size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request};
+
+    #[test]
+    fn file_route_supports_partial_content() {
+        let temp_dir = std::env::temp_dir().join(format!("lanqr-test-{}", random_route(8)));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("large.bin");
+        let expected = vec![0x5a; 256 * 1024];
+        fs::write(&file_path, &expected).unwrap();
+
+        let runtime = RuntimeBuilder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let app = build_file_router(file_path.clone(), "/send/test".to_string());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/send/test")
+                        .header(header::RANGE, "bytes=0-65535")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response.headers().get(header::CONTENT_RANGE).unwrap(),
+                "bytes 0-65535/262144"
+            );
+            assert_eq!(
+                response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+                "attachment; filename=\"large.bin\"; filename*=UTF-8''large.bin"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.len(), 65536);
+            assert_eq!(body.as_ref(), &expected[..65536]);
+        });
+
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn directory_listing_keeps_navigation() {
+        let temp_dir = std::env::temp_dir().join(format!("lanqr-test-{}", random_route(8)));
+        let nested = temp_dir.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("hello.txt"), b"hello").unwrap();
+
+        let html = build_directory_listing_html(&nested, Path::new("sub")).unwrap();
+        assert!(html.contains("../"));
+        assert!(html.contains("hello.txt"));
+
+        let _ = fs::remove_file(nested.join("hello.txt"));
+        let _ = fs::remove_dir(&nested);
+        let _ = fs::remove_dir(&temp_dir);
+    }
 }

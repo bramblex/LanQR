@@ -23,6 +23,7 @@ $distRoot = Join-Path $repoRoot "dist"
 $packageRoot = Join-Path $distRoot "LanQR"
 $releaseDir = Join-Path $repoRoot "target\release"
 $binaryPath = Join-Path $releaseDir "LanQR.exe"
+$iconPath = Join-Path $repoRoot "target\generated\LanQR.ico"
 
 Write-Host "==> Building LanQR release binary"
 Push-Location $repoRoot
@@ -37,6 +38,10 @@ if (-not (Test-Path -LiteralPath $binaryPath)) {
     throw "Build succeeded but LanQR.exe was not found at: $binaryPath"
 }
 
+if (-not (Test-Path -LiteralPath $iconPath)) {
+    throw "Build succeeded but LanQR.ico was not found at: $iconPath"
+}
+
 Write-Host "==> Preparing dist directory"
 New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 
@@ -44,9 +49,11 @@ $legacyQrcp = Join-Path $packageRoot "qrcp.exe"
 if (Test-Path -LiteralPath $legacyQrcp) {
     Remove-Item -LiteralPath $legacyQrcp -Force
 }
+$packageIcon = Join-Path $packageRoot "LanQR.ico"
 
 Write-Host "==> Copying files to dist\LanQR"
 Copy-WithFriendlyLockError -Source $binaryPath -Destination (Join-Path $packageRoot "LanQR.exe") -Label "LanQR.exe"
+Copy-WithFriendlyLockError -Source $iconPath -Destination $packageIcon -Label "LanQR.ico"
 Copy-WithFriendlyLockError -Source (Join-Path $repoRoot "README.md") -Destination (Join-Path $packageRoot "README.md") -Label "README.md"
 
 Write-Host ""

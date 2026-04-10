@@ -12,8 +12,10 @@ mod share_service;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui;
+use eframe::icon_data;
 use tracing::{error, info};
 
 use crate::app::LanQrApp;
@@ -55,7 +57,8 @@ fn launch_gui(launch_mode: LaunchMode, exe_path: PathBuf) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("邻享码")
             .with_inner_size([520.0, 720.0])
-            .with_min_inner_size([480.0, 640.0]),
+            .with_min_inner_size([480.0, 640.0])
+            .with_icon(load_app_icon()?),
         ..Default::default()
     };
 
@@ -67,6 +70,12 @@ fn launch_gui(launch_mode: LaunchMode, exe_path: PathBuf) -> Result<()> {
     .map_err(|error| LanQrError::Message(format!("启动 GUI 失败：{error}")))?;
 
     Ok(())
+}
+
+fn load_app_icon() -> Result<Arc<egui::IconData>> {
+    let icon = icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .map_err(|error| LanQrError::Message(format!("加载程序图标失败：{error}")))?;
+    Ok(Arc::new(icon))
 }
 
 enum ParsedLaunch {
